@@ -1,0 +1,5 @@
+*.enc
+.vault-key
+.salt
+.keywrap
+.unlocked

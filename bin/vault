@@ -1,0 +1,435 @@
+#!/bin/bash
+# ─── Hermes Secrets Vault CLI (Password-Protected) ────────────────────
+# Usage:
+#   vault init                - Initialize vault (set master password)
+#   vault unlock              - Unlock vault with password → exports env vars
+#   vault lock                - Lock vault (clear env vars)
+#   vault set <name>          - Store secret (vault must be unlocked)
+#   vault get <name>          - Get secret (vault must be unlocked)
+#   vault list                - List all secrets
+#   vault rm <name>           - Remove a secret
+#   vault status              - Show vault status (locked/unlocked)
+#   vault env <name>          - Print as NAME=value
+#   vault change-password     - Change master password
+# ──────────────────────────────────────────────────────────────────────
+
+VAULT_DIR="${HERMES_VAULT_DIR:-$HOME/.hermes/vault}"
+SALT_FILE="$VAULT_DIR/.salt"
+KEYWRAP_FILE="$VAULT_DIR/.keywrap"   # vault key encrypted with password
+CACHE_FILE="$VAULT_DIR/.unlocked"    # flag: vault is unlocked this session
+MAPPING_FILE="$VAULT_DIR/.mapping"
+
+mkdir -p "$VAULT_DIR" && chmod 700 "$VAULT_DIR"
+
+# ─── Env var name mapping ─────────────────────────────────────────────
+get_env_name() {
+    local NAME="$1"
+    case "$NAME" in
+        supabase-token)     echo "SUPABASE_ACCESS_TOKEN" ;;
+        n8n-token)          echo "N8N_MCP_TOKEN" ;;
+        stripe-key)         echo "STRIPE_SECRET_KEY" ;;
+        stripe-webhook)     echo "STRIPE_WEBHOOK_SECRET" ;;
+        openai-key)         echo "OPENAI_API_KEY" ;;
+        openrouter-key)     echo "OPENROUTER_API_KEY" ;;
+        resend-key)         echo "RESEND_API_KEY" ;;
+        hostinger-token)    echo "HOSTINGER_API_TOKEN" ;;
+        github-token)       echo "GITHUB_TOKEN" ;;
+        twilio-account-sid) echo "TWILIO_ACCOUNT_SID" ;;
+        twilio-auth-token)  echo "TWILIO_AUTH_TOKEN" ;;
+        *)                  echo "$NAME" | tr '[:lower:]-' '[:upper:]_' ;;
+    esac
+}
+
+# ─── Password prompt ──────────────────────────────────────────────────
+read_password() {
+    local PROMPT="$1"
+    if [ -t 0 ]; then
+        # Interactive terminal
+        read -r -s -p "$PROMPT" PASSWORD
+        echo "" >&2
+        echo "$PASSWORD"
+    else
+        # Non-interactive (pipe or redirect) - read from /dev/tty if available
+        if [ -c /dev/tty ] 2>/dev/null; then
+            read -r -s -p "$PROMPT" PASSWORD < /dev/tty
+            echo "" >&2
+            echo "$PASSWORD"
+        else
+            echo "" >&2
+            return 1
+        fi
+    fi
+}
+
+# ─── Derive key from password ─────────────────────────────────────────
+derive_key() {
+    local PASSWORD="$1"
+    local SALT=$(cat "$SALT_FILE")
+    echo -n "$PASSWORD" | openssl kdf -keylen 32 -kdfopt digest:SHA-256 \
+        -kdfopt pass:"$PASSWORD" -kdfopt salt:"$SALT" \
+        -kdfopt iter:100000 -binary PBKDF2 2>/dev/null | base64 -w0
+}
+
+# ─── Check if vault is initialized ────────────────────────────────────
+is_initialized() {
+    [ -f "$SALT_FILE" ] && [ -f "$KEYWRAP_FILE" ]
+}
+
+# ─── Check if vault is unlocked ───────────────────────────────────────
+is_unlocked() {
+    [ -f "$CACHE_FILE" ] && [ -n "$VAULT_KEY_CACHED" ]
+}
+
+# ─── Unlock with password ─────────────────────────────────────────────
+unlock_vault() {
+    local PASSWORD="$1"
+    if [ -z "$PASSWORD" ]; then
+        PASSWORD=$(read_password "Vault password: ") || return 1
+    fi
+    
+    # Decrypt the wrapped vault key
+    local SALT=$(cat "$SALT_FILE")
+    VAULT_KEY_CACHED=$(openssl enc -d -aes-256-cbc -base64 -pbkdf2 -iter 100000 \
+        -pass pass:"$PASSWORD" -in "$KEYWRAP_FILE" 2>/dev/null)
+    
+    if [ -z "$VAULT_KEY_CACHED" ]; then
+        echo "✗ Wrong password or corrupted vault" >&2
+        return 1
+    fi
+    
+    export VAULT_KEY_CACHED
+    touch "$CACHE_FILE"
+    
+    # Export all secrets as env vars
+    local COUNT=0
+    for ENC_FILE in "$VAULT_DIR"/*.enc; do
+        [ -f "$ENC_FILE" ] || continue
+        local NAME=$(basename "$ENC_FILE" .enc)
+        local VAR=$(get_env_name "$NAME")
+        local VALUE=$(openssl enc -d -aes-256-cbc -base64 -pbkdf2 -iter 100000 \
+            -pass pass:"$VAULT_KEY_CACHED" -in "$ENC_FILE" 2>/dev/null)
+        if [ -n "$VALUE" ]; then
+            export "$VAR=$VALUE"
+            COUNT=$((COUNT + 1))
+        fi
+    done
+    
+    echo "✓ Vault unlocked — $COUNT secret(s) exported" >&2
+    echo "# Vault unlocked — source this output"
+    echo "export VAULT_UNLOCKED=1"
+    for ENC_FILE in "$VAULT_DIR"/*.enc; do
+        [ -f "$ENC_FILE" ] || continue
+        NAME=$(basename "$ENC_FILE" .enc)
+        VAR=$(get_env_name "$NAME")
+        VALUE=$(openssl enc -d -aes-256-cbc -base64 -pbkdf2 -iter 100000 \
+            -pass pass:"$VAULT_KEY_CACHED" -in "$ENC_FILE" 2>/dev/null)
+        if [ -n "$VALUE" ]; then
+            echo "export $VAR=$VALUE"
+        fi
+    done
+    return 0
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────
+case "${1:-help}" in
+    init)
+        if is_initialized; then
+            echo "Vault already initialized. Use 'vault change-password' to reset."
+            exit 1
+        fi
+        
+        echo "=== Initialize Secrets Vault ==="
+        PASSWORD1=$(read_password "Create master password: ") || { echo "No TTY available"; exit 1; }
+        PASSWORD2=$(read_password "Confirm master password: ") || { echo "No TTY available"; exit 1; }
+        
+        if [ "$PASSWORD1" != "$PASSWORD2" ]; then
+            echo "✗ Passwords don't match"
+            exit 1
+        fi
+        
+        # Generate salt and random vault key (256-bit)
+        openssl rand -base64 32 > "$SALT_FILE"
+VAULT_KEY=$(openssl rand -base64 32)
+        
+        # Encrypt vault key with password
+        echo -n "$VAULT_KEY" | openssl enc -aes-256-cbc -base64 -pbkdf2 -iter 100000 \
+            -pass pass:"$PASSWORD1" -out "$KEYWRAP_FILE"
+        
+        chmod 600 "$SALT_FILE" "$KEYWRAP_FILE"
+        echo "✓ Vault initialized. Use 'vault unlock' to access secrets."
+        ;;
+    
+    unlock)
+        if ! is_initialized; then
+            echo "Vault not initialized. Run 'vault init' first."
+            exit 1
+        fi
+        
+        unlock_vault "$2"
+        ;;
+    
+    lock)
+        unset VAULT_KEY_CACHED
+        rm -f "$CACHE_FILE"
+        # Clear all possible vault env vars
+        for ENC_FILE in "$VAULT_DIR"/*.enc; do
+            [ -f "$ENC_FILE" ] || continue
+        NAME=$(basename "$ENC_FILE" .enc)
+        VAR=$(get_env_name "$NAME")
+        unset "$VAR"
+        done
+        echo "✓ Vault locked — all secrets cleared from environment"
+        ;;
+    
+    status)
+        if ! is_initialized; then
+            echo "Vault status: NOT INITIALIZED"
+            echo "Run 'vault init' to create your vault."
+            exit 0
+        fi
+        if is_unlocked; then
+            echo "Vault status: ✅ UNLOCKED"
+            echo "Secrets are loaded in environment."
+        else
+            echo "Vault status: 🔒 LOCKED"
+            echo "Run 'vault unlock' to access your secrets."
+        fi
+        
+        COUNT=0
+        for f in "$VAULT_DIR"/*.enc; do
+            [ -f "$f" ] && COUNT=$((COUNT + 1))
+        done
+        echo "Encrypted secrets: $COUNT"
+        ;;
+    
+    set)
+        if ! is_unlocked; then
+            echo "✗ Vault is locked. Run 'vault unlock' first."
+            exit 1
+        fi
+        
+NAME="$2"
+        if [ -z "$NAME" ]; then echo "Usage: vault set <name>"; exit 1; fi
+        
+        echo "Paste or type the secret value (Ctrl+D when done):" >&2
+VALUE=$(cat)
+        
+        if [ -z "$VALUE" ]; then
+            echo "✗ No value provided"
+            exit 1
+        fi
+        
+        echo -n "$VALUE" | openssl enc -aes-256-cbc -base64 -pbkdf2 -iter 100000 \
+            -pass pass:"$VAULT_KEY_CACHED" -out "$VAULT_DIR/$NAME.enc" 2>/dev/null
+        chmod 600 "$VAULT_DIR/$NAME.enc"
+        
+        # Export as env var immediately
+VAR=$(get_env_name "$NAME")
+        export "$VAR=$VALUE"
+        
+        # Compute SHA fingerprint and update index
+SHA8=$(echo -n "$VALUE" | sha256sum | cut -c1-8)
+TODAY=$(date +%Y-%m-%d)
+        
+        if grep -q "^$NAME|" "$VAULT_DIR/.index" 2>/dev/null; then
+            sed -i "s|^$NAME|.*|$NAME | $VAR | sha8:$SHA8 | |" "$VAULT_DIR/.index" 2>/dev/null
+        else
+            echo "$NAME | $VAR | sha8:$SHA8 | (sin descripción) | $TODAY | " >> "$VAULT_DIR/.index"
+        fi
+        sort -o "$VAULT_DIR/.index" "$VAULT_DIR/.index" 2>/dev/null
+        
+        echo "✓ Secret '$NAME' stored → \${$VAR} (sha8:$SHA8)"
+        ;;
+    
+    get)
+        if ! is_unlocked; then
+            echo "✗ Vault is locked. Run 'vault unlock' first."
+            exit 1
+        fi
+        
+NAME="$2"
+        if [ -z "$NAME" ]; then echo "Usage: vault get <name>"; exit 1; fi
+        
+ENC_FILE="$VAULT_DIR/$NAME.enc"
+        if [ ! -f "$ENC_FILE" ]; then echo "✗ Secret '$NAME' not found"; exit 1; fi
+        
+        openssl enc -d -aes-256-cbc -base64 -pbkdf2 -iter 100000 \
+            -pass pass:"$VAULT_KEY_CACHED" -in "$ENC_FILE" 2>/dev/null
+        ;;
+    
+    list)
+        echo "=== Hermes Secrets Vault ==="
+        echo ""
+        
+        # Show index (no unlock needed)
+        if [ -f "$VAULT_DIR/.index" ]; then
+            echo "📋 Index — qué hay guardado:"
+            echo ""
+            while IFS='|' read -r NAME ENVVAR SHA DESC DATE LOCATION; do
+                # Skip comments and empty lines
+                [[ "$NAME" =~ ^# ]] && continue
+                [ -z "$NAME" ] && continue
+                NAME=$(echo "$NAME" | xargs)
+                ENVVAR=$(echo "$ENVVAR" | xargs)
+                SHA=$(echo "$SHA" | xargs)
+                DESC=$(echo "$DESC" | xargs)
+                DATE=$(echo "$DATE" | xargs)
+                LOCATION=$(echo "$LOCATION" | xargs)
+                echo "  📌 $NAME"
+                echo "     Env: \${$ENVVAR}"
+                echo "     ID:  $SHA"
+                echo "     Para: $DESC"
+                echo "     Desde: $DATE"
+                [ -n "$LOCATION" ] && echo "     Usa en: $LOCATION"
+                echo ""
+            done < "$VAULT_DIR/.index"
+        fi
+        
+        # Check for unindexed secrets
+        UNINDEXED=0
+        for f in "$VAULT_DIR"/*.enc; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f" .enc)
+            grep -q "^$NAME[[:space:]]*|" "$VAULT_DIR/.index" 2>/dev/null || UNINDEXED=$((UNINDEXED + 1))
+        done
+        
+        STATUS="🔒 LOCKED"
+        is_unlocked && STATUS="✅ UNLOCKED"
+        echo "---"
+        echo "Status: $STATUS"
+        [ $UNINDEXED -gt 0 ] && echo "⚠️  $UNINDEXED secret(s) sin indexar (usar 'vault index' para actualizar)"
+        ;;
+    
+    rm|remove)
+        if ! is_unlocked; then
+            echo "✗ Vault is locked. Run 'vault unlock' first."
+            exit 1
+        fi
+        
+NAME="$2"
+        if [ -z "$NAME" ]; then echo "Usage: vault rm <name>"; exit 1; fi
+        
+ENC_FILE="$VAULT_DIR/$NAME.enc"
+        if [ ! -f "$ENC_FILE" ]; then echo "✗ Secret '$NAME' not found"; exit 1; fi
+        
+        rm -f "$ENC_FILE" && echo "✓ Secret '$NAME' removed"
+        
+        # Remove from index
+        sed -i "/^$NAME|/d" "$VAULT_DIR/.index" 2>/dev/null
+        
+        # Also clear from env if loaded
+VAR=$(get_env_name "$NAME")
+        unset "$VAR"
+        ;;
+    
+    env)
+        if ! is_unlocked; then
+            echo "✗ Vault is locked. Run 'vault unlock' first."
+            exit 1
+        fi
+        
+NAME="$2"
+        if [ -z "$NAME" ]; then echo "Usage: vault env <name>"; exit 1; fi
+        
+VALUE=$(vault get "$NAME" 2>/dev/null)
+        if [ $? -ne 0 ]; then exit 1; fi
+        
+VAR=$(get_env_name "$NAME")
+        echo "${VAR}=${VALUE}"
+        ;;
+    
+    index)
+        echo "=== Vault Index ==="
+        echo ""
+        if [ ! -f "$VAULT_DIR/.index" ]; then
+            echo "📭 No index yet. Run 'vault list' first to generate."
+            exit 0
+        fi
+        echo "📋 Stored secrets:"
+        echo ""
+        while IFS='|' read -r NAME ENVVAR SHA DESC DATE LOCATION; do
+            [[ "$NAME" =~ ^# ]] && continue
+            [ -z "$NAME" ] && continue
+            NAME=$(echo "$NAME" | xargs)
+            ENVVAR=$(echo "$ENVVAR" | xargs)
+            SHA=$(echo "$SHA" | xargs)
+            DESC=$(echo "$DESC" | xargs)
+            echo "  📌 $NAME  →  \${$ENVVAR}  ($SHA)"
+            echo "     $DESC"
+            echo ""
+        done < "$VAULT_DIR/.index"
+        ;;
+    
+    check)
+        VALUE=$(cat)
+        if [ -z "$VALUE" ]; then
+            echo "Usage: echo '<value>' | vault check"
+            echo "Checks if a value is already stored (by SHA match)"
+            exit 0
+        fi
+        TARGET_SHA=$(echo -n "$VALUE" | sha256sum | cut -c1-8)
+        MATCH=$(grep "sha8:$TARGET_SHA" "$VAULT_DIR/.index" 2>/dev/null)
+        if [ -n "$MATCH" ]; then
+            NAME=$(echo "$MATCH" | cut -d'|' -f1 | xargs)
+            echo "✅ Match found: '$NAME' (sha8:$TARGET_SHA)"
+        else
+            echo "❌ No matching secret in vault (sha8:$TARGET_SHA)"
+        fi
+        ;;
+    
+    change-password)
+        if ! is_initialized; then
+            echo "Vault not initialized. Run 'vault init' first."
+            exit 1
+        fi
+        
+        echo "=== Change Vault Password ==="
+        OLD_PASS=$(read_password "Current password: ") || { echo "No TTY available"; exit 1; }
+        
+        # Try to unlock with old password to get vault key
+        SALT=$(cat "$SALT_FILE")
+        VAULT_KEY=$(openssl enc -d -aes-256-cbc -base64 -pbkdf2 -iter 100000 \
+            -pass pass:"$OLD_PASS" -in "$KEYWRAP_FILE" 2>/dev/null)
+        
+        if [ -z "$VAULT_KEY" ]; then
+            echo "✗ Wrong password"
+            exit 1
+        fi
+        
+        NEW_PASS1=$(read_password "New password: ")
+        NEW_PASS2=$(read_password "Confirm new password: ")
+        
+        if [ "$NEW_PASS1" != "$NEW_PASS2" ]; then
+            echo "✗ Passwords don't match"
+            exit 1
+        fi
+        
+        # Re-wrap vault key with new password
+        echo -n "$VAULT_KEY" | openssl enc -aes-256-cbc -base64 -pbkdf2 -iter 100000 \
+            -pass pass:"$NEW_PASS1" -out "$KEYWRAP_FILE"
+        
+        echo "✓ Password changed successfully"
+        ;;
+    
+    *)
+        echo "Hermes Secrets Vault (password-protected)"
+        echo ""
+        echo "Usage:"
+        echo "  vault init              Initialize vault (set master password)"
+        echo "  vault unlock [pass]     Unlock vault → exports env vars"
+        echo "  vault lock              Lock vault (clear secrets from env)"
+        echo "  vault status            Show vault status"
+        echo "  vault set <name>        Store a secret"
+        echo "  vault get <name>        Retrieve a secret"
+        echo "  vault list              List all secrets"
+        echo "  vault rm <name>         Remove a secret"
+        echo "  vault env <name>        Print as NAME=value"
+        echo "  vault change-password   Change master password"
+        echo ""
+        echo "Examples:"
+        echo "  vault init"
+        echo "  vault unlock"
+        echo "  echo 'sk-xxx' | vault set openai-key"
+        echo "  vault get supabase-token"
+        ;;
+esac
